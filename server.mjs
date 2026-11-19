@@ -72,6 +72,9 @@ class WsConn {
     try {
       if (!this.socket.destroyed) {
         this.socket.end(encodeCloseFrame(code));
+        setTimeout(() => {
+          if (!this.socket.destroyed) this.socket.destroy();
+        }, 250).unref();
       }
     } catch {
       this.socket.destroy();
@@ -143,6 +146,7 @@ function processRxBuffer(conn) {
       const bigLen = conn.rxBuf.readBigUInt64BE(offset);
       if (bigLen > BigInt(MAX_MSG_BYTES)) {
         conn.closeWithCode(1009);
+        detachConnection(conn);
         return;
       }
       payloadLen = Number(bigLen);
@@ -151,6 +155,7 @@ function processRxBuffer(conn) {
 
     if (payloadLen > MAX_MSG_BYTES) {
       conn.closeWithCode(1009);
+      detachConnection(conn);
       return;
     }
 
@@ -175,6 +180,7 @@ function processRxBuffer(conn) {
 
     if (opcode === 0x8) {
       conn.closeWithCode(1000);
+      detachConnection(conn);
       return;
     }
     if (opcode === 0x9) {
@@ -202,6 +208,7 @@ function processRxBuffer(conn) {
         conn.fragChunks = [];
         conn.fragBytes = 0;
         conn.closeWithCode(1009);
+        detachConnection(conn);
         return;
       }
       if (fin) {
@@ -294,6 +301,7 @@ server.on("upgrade", (req, socket, head) => {
     processRxBuffer(conn);
   });
 
+  socket.on("end", () => detachConnection(conn));
   socket.on("close", () => detachConnection(conn));
   socket.on("error", () => {
     detachConnection(conn);
