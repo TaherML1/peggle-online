@@ -1,0 +1,14 @@
+{
+  "name": "peggle-online-relay",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Zero-dependency WebSocket room-code relay for Peggle Nights Online Duel",
+  "type": "module",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

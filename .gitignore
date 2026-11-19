@@ -1,0 +1,8 @@
+*.dll
+*.exe
+*.obj
+*.lib
+*.exp
+*.zip
+*.log
+node_modules/
