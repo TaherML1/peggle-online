@@ -24,17 +24,24 @@
 #define IDC_EDIT_GAMEDIR    101
 #define IDC_BTN_BROWSE      102
 #define IDC_EDIT_RELAYURL   103
-#define IDC_RADIO_HOST      104
-#define IDC_RADIO_JOIN      105
-#define IDC_EDIT_ROOMCODE   106
-#define IDC_BTN_NEWCODE     107
-#define IDC_BTN_COPYCODE    108
-#define IDC_BTN_PLAY_ONLINE 109
-#define IDC_BTN_PLAY_OFF    110
-#define IDC_BTN_UNINSTALL   111
-#define IDC_STATIC_STATUS   112
+#define IDC_EDIT_PLAYERNAME 104
+#define IDC_RADIO_1V1       105
+#define IDC_RADIO_2V2       106
+#define IDC_COMBO_SLOT      107
+#define IDC_COMBO_BALLS     108
+#define IDC_EDIT_ROOMCODE   109
+#define IDC_BTN_NEWCODE     110
+#define IDC_BTN_COPYCODE    111
+#define IDC_EDIT_LBCODE     112
+#define IDC_BTN_CREATELB    113
+#define IDC_BTN_OPENLB      114
+#define IDC_BTN_PLAY_ONLINE 115
+#define IDC_BTN_PLAY_OFF    116
+#define IDC_BTN_UNINSTALL   117
+#define IDC_STATIC_STATUS   118
 
-#define WM_APP_WAKE_DONE    (WM_USER + 1)
+#define WM_APP_WAKE_DONE     (WM_USER + 1)
+#define WM_APP_CREATELB_DONE (WM_USER + 2)
 
 static const char* kDefaultRelayUrl = "https://peggle-online-relay.onrender.com";
 
@@ -43,11 +50,17 @@ static HWND  g_HwndMain = nullptr;
 static HWND  g_EditGameDir = nullptr;
 static HWND  g_BtnBrowse = nullptr;
 static HWND  g_EditRelayUrl = nullptr;
-static HWND  g_RadioHost = nullptr;
-static HWND  g_RadioJoin = nullptr;
+static HWND  g_EditPlayerName = nullptr;
+static HWND  g_Radio1v1 = nullptr;
+static HWND  g_Radio2v2 = nullptr;
+static HWND  g_ComboSlot = nullptr;
+static HWND  g_ComboBalls = nullptr;
 static HWND  g_EditRoomCode = nullptr;
 static HWND  g_BtnNewCode = nullptr;
 static HWND  g_BtnCopyCode = nullptr;
+static HWND  g_EditLbCode = nullptr;
+static HWND  g_BtnCreateLb = nullptr;
+static HWND  g_BtnOpenLb = nullptr;
 static HWND  g_BtnPlayOnline = nullptr;
 static HWND  g_BtnPlayOffline = nullptr;
 static HWND  g_BtnUninstall = nullptr;
@@ -60,7 +73,7 @@ static HFONT g_FontTitle = nullptr;
 
 static char  g_LauncherDir[MAX_PATH] = {};
 static char  g_RelayConfigIni[MAX_PATH] = {};
-static bool  g_Waking = false;
+static bool  g_Busy = false;
 
 static int S(int px) {
     return MulDiv(px, g_Dpi, 96);
@@ -135,7 +148,6 @@ static void ParseLibraryFoldersVdf(const char* vdfPath, std::vector<std::string>
 }
 
 static bool DetectPeggleNightsDir(char* outDir, size_t outCap) {
-    // 1. Check saved game_dir from relay_config.ini
     char savedDir[MAX_PATH] = {};
     GetPrivateProfileStringA("Relay", "game_dir", "", savedDir, sizeof(savedDir), g_RelayConfigIni);
     TrimTrailingSlash(savedDir);
@@ -144,7 +156,6 @@ static bool DetectPeggleNightsDir(char* outDir, size_t outCap) {
         return true;
     }
 
-    // 2. Check launcher directory itself
     char selfDir[MAX_PATH];
     snprintf(selfDir, sizeof(selfDir), "%s", g_LauncherDir);
     TrimTrailingSlash(selfDir);
@@ -153,7 +164,6 @@ static bool DetectPeggleNightsDir(char* outDir, size_t outCap) {
         return true;
     }
 
-    // 3. Check Steam registry + libraryfolders.vdf
     HKEY hKey = nullptr;
     if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Valve\\Steam", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
         char steamPath[MAX_PATH] = {};
@@ -184,7 +194,6 @@ static bool DetectPeggleNightsDir(char* outDir, size_t outCap) {
         RegCloseKey(hKey);
     }
 
-    // 4. Common non-Steam PopCap fallbacks
     const char* fallbacks[] = {
         "C:\\Program Files (x86)\\PopCap Games\\Peggle Nights",
         "C:\\Program Files\\PopCap Games\\Peggle Nights",
@@ -276,6 +285,39 @@ static bool InstallModToGameDir(const char* gameDir, char* errBuf, size_t errCap
     return true;
 }
 
+static int GetSelectedSlot() {
+    int sel = (int)SendMessageA(g_ComboSlot, CB_GETCURSEL, 0, 0);
+    return (sel < 0) ? 0 : sel;
+}
+
+static bool Is2v2Selected() {
+    return (SendMessageA(g_Radio2v2, BM_GETCHECK, 0, 0) == BST_CHECKED);
+}
+
+static int GetSelectedBallsPerPlayer() {
+    int idx = (int)SendMessageA(g_ComboBalls, CB_GETCURSEL, 0, 0);
+    static const int kBalls[4] = { 3, 4, 5, 6 };
+    if (idx < 0 || idx > 3) return 4;
+    return kBalls[idx];
+}
+
+static void PopulateSlotCombo(bool is2v2, int keepSlot) {
+    SendMessageA(g_ComboSlot, CB_RESETCONTENT, 0, 0);
+    if (is2v2) {
+        SendMessageA(g_ComboSlot, CB_ADDSTRING, 0, (LPARAM)"Team A - Player 1 (Host)");
+        SendMessageA(g_ComboSlot, CB_ADDSTRING, 0, (LPARAM)"Team B - Player 2");
+        SendMessageA(g_ComboSlot, CB_ADDSTRING, 0, (LPARAM)"Team A - Player 3");
+        SendMessageA(g_ComboSlot, CB_ADDSTRING, 0, (LPARAM)"Team B - Player 4");
+        if (keepSlot < 0 || keepSlot > 3) keepSlot = 0;
+    } else {
+        SendMessageA(g_ComboSlot, CB_ADDSTRING, 0, (LPARAM)"Player 1 (Host)");
+        SendMessageA(g_ComboSlot, CB_ADDSTRING, 0, (LPARAM)"Player 2 (Join)");
+        if (keepSlot < 0 || keepSlot > 1) keepSlot = 0;
+    }
+    SendMessageA(g_ComboSlot, CB_SETCURSEL, (WPARAM)keepSlot, 0);
+    EnableWindow(g_ComboBalls, !g_Busy && keepSlot == 0);
+}
+
 static void SetStatusText(const char* text) {
     SetWindowTextA(g_StaticStatus, text);
 }
@@ -284,11 +326,17 @@ static void SetUiEnabled(bool enabled) {
     EnableWindow(g_EditGameDir, enabled);
     EnableWindow(g_BtnBrowse, enabled);
     EnableWindow(g_EditRelayUrl, enabled);
-    EnableWindow(g_RadioHost, enabled);
-    EnableWindow(g_RadioJoin, enabled);
+    EnableWindow(g_EditPlayerName, enabled);
+    EnableWindow(g_Radio1v1, enabled);
+    EnableWindow(g_Radio2v2, enabled);
+    EnableWindow(g_ComboSlot, enabled);
+    EnableWindow(g_ComboBalls, enabled && GetSelectedSlot() == 0);
     EnableWindow(g_EditRoomCode, enabled);
     EnableWindow(g_BtnNewCode, enabled);
     EnableWindow(g_BtnCopyCode, enabled);
+    EnableWindow(g_EditLbCode, enabled);
+    EnableWindow(g_BtnCreateLb, enabled);
+    EnableWindow(g_BtnOpenLb, enabled);
     EnableWindow(g_BtnPlayOnline, enabled);
     EnableWindow(g_BtnPlayOffline, enabled);
     EnableWindow(g_BtnUninstall, enabled);
@@ -312,11 +360,31 @@ static void SanitizeRoomCode(const char* raw, char* out, size_t cap) {
     size_t w = 0;
     for (size_t i = 0; raw[i] && w + 1 < cap && w < 12; i++) {
         unsigned char c = (unsigned char)raw[i];
-        if (isalnum(c)) {
-            out[w++] = (char)toupper(c);
+        if (isalnum(c)) out[w++] = (char)toupper(c);
+    }
+    out[w] = '\0';
+}
+
+static void SanitizeLbCode(const char* raw, char* out, size_t cap) {
+    size_t w = 0;
+    for (size_t i = 0; raw[i] && w + 1 < cap && w < 16; i++) {
+        unsigned char c = (unsigned char)raw[i];
+        if (isalnum(c) || c == '-') out[w++] = (char)toupper(c);
+    }
+    out[w] = '\0';
+}
+
+static void SanitizeDisplayName(const char* raw, char* out, size_t cap) {
+    size_t w = 0;
+    for (size_t i = 0; raw[i] && w + 1 < cap && w < 24; i++) {
+        unsigned char c = (unsigned char)raw[i];
+        if (c >= 0x20 && c != 0x7f && c != '"' && c != '\\') {
+            out[w++] = (char)c;
         }
     }
     out[w] = '\0';
+    while (w > 0 && isspace((unsigned char)out[w - 1])) out[--w] = '\0';
+    if (w == 0) snprintf(out, cap, "Player");
 }
 
 static void TrimWhitespace(char* s) {
@@ -329,14 +397,45 @@ static void TrimWhitespace(char* s) {
     s[end - start] = '\0';
 }
 
-static bool WriteGameIni(const char* gameDir, bool enabled, const char* role, const char* relayUrl, const char* roomCode) {
+static void CopyTextToClipboard(const char* text) {
+    if (!text || !text[0]) return;
+    if (OpenClipboard(g_HwndMain)) {
+        EmptyClipboard();
+        size_t len = strlen(text) + 1;
+        HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, len);
+        if (hMem) {
+            void* ptr = GlobalLock(hMem);
+            memcpy(ptr, text, len);
+            GlobalUnlock(hMem);
+            SetClipboardData(CF_TEXT, hMem);
+        }
+        CloseClipboard();
+    }
+}
+
+static bool WriteGameIni(
+    const char* gameDir,
+    bool enabled,
+    int modePlayers,
+    int playerSlot,
+    int ballsPerPlayer,
+    const char* playerName,
+    const char* lbCode,
+    const char* relayUrl,
+    const char* roomCode
+) {
     char iniPath[MAX_PATH];
     snprintf(iniPath, sizeof(iniPath), "%s\\peggle_online.ini", gameDir);
     FILE* f = fopen(iniPath, "w");
     if (!f) return false;
     fprintf(f, "[Online]\n");
     fprintf(f, "enabled = %d\n", enabled ? 1 : 0);
-    fprintf(f, "role = %s\n", role);
+    fprintf(f, "role = %s\n", (playerSlot == 0) ? "ws_host" : "ws_client");
+    fprintf(f, "mode_players = %d\n", modePlayers);
+    fprintf(f, "player_slot = %d\n", playerSlot);
+    fprintf(f, "balls_per_player = %d\n", ballsPerPlayer);
+    fprintf(f, "player_name = %s\n", playerName);
+    fprintf(f, "leaderboard_code = %s\n", lbCode);
     fprintf(f, "relay_url = %s\n", relayUrl);
     fprintf(f, "room_code = %s\n", roomCode);
     fprintf(f, "host_ip = 127.0.0.1\n");
@@ -345,9 +444,23 @@ static bool WriteGameIni(const char* gameDir, bool enabled, const char* role, co
     return true;
 }
 
-static void SaveRelayConfigIni(const char* relayUrl, const char* gameDir) {
+static void SaveRelayConfigIni(
+    const char* relayUrl,
+    const char* gameDir,
+    const char* playerName,
+    const char* lbCode,
+    int modePlayers,
+    int ballsPerPlayer
+) {
+    char numBuf[16];
     WritePrivateProfileStringA("Relay", "relay_url", relayUrl, g_RelayConfigIni);
     WritePrivateProfileStringA("Relay", "game_dir", gameDir, g_RelayConfigIni);
+    WritePrivateProfileStringA("Relay", "player_name", playerName, g_RelayConfigIni);
+    WritePrivateProfileStringA("Relay", "leaderboard_code", lbCode, g_RelayConfigIni);
+    snprintf(numBuf, sizeof(numBuf), "%d", modePlayers);
+    WritePrivateProfileStringA("Relay", "mode_players", numBuf, g_RelayConfigIni);
+    snprintf(numBuf, sizeof(numBuf), "%d", ballsPerPlayer);
+    WritePrivateProfileStringA("Relay", "balls_per_player", numBuf, g_RelayConfigIni);
 }
 
 static void LaunchPeggleGame(const char* gameDir) {
@@ -360,12 +473,16 @@ static void LaunchPeggleGame(const char* gameDir) {
     }
 }
 
-struct WakeThreadArgs {
-    std::string relayUrl;
-    std::string gameDir;
-};
-
-static bool WakeRelayHealth(const char* rawUrl, DWORD* outStatusOrErr) {
+static bool ParseRelayHttpTarget(
+    const char* rawUrl,
+    wchar_t* outHost,
+    DWORD outHostCap,
+    INTERNET_PORT* outPort,
+    bool* outSecure,
+    wchar_t* outBasePath,
+    DWORD outBasePathCap,
+    std::string* outNormalizedBase
+) {
     char normalized[320] = {};
     if (_strnicmp(rawUrl, "wss://", 6) == 0) {
         snprintf(normalized, sizeof(normalized), "https://%s", rawUrl + 6);
@@ -377,32 +494,53 @@ static bool WakeRelayHealth(const char* rawUrl, DWORD* outStatusOrErr) {
         snprintf(normalized, sizeof(normalized), "https://%s", rawUrl);
     }
 
+    size_t nlen = strlen(normalized);
+    while (nlen > 0 && normalized[nlen - 1] == '/') normalized[--nlen] = '\0';
+    if (outNormalizedBase) *outNormalizedBase = normalized;
+
     wchar_t wideUrl[320] = {};
     MultiByteToWideChar(CP_UTF8, 0, normalized, -1, wideUrl, 320);
 
-    wchar_t hostName[160] = {};
-    wchar_t basePath[160] = {};
+    wchar_t pathBuf[256] = {};
     URL_COMPONENTSW uc = {};
     uc.dwStructSize = sizeof(uc);
-    uc.lpszHostName = hostName;
-    uc.dwHostNameLength = 160;
-    uc.lpszUrlPath = basePath;
-    uc.dwUrlPathLength = 160;
+    uc.lpszHostName = outHost;
+    uc.dwHostNameLength = outHostCap;
+    uc.lpszUrlPath = pathBuf;
+    uc.dwUrlPathLength = 256;
 
-    if (!WinHttpCrackUrl(wideUrl, 0, 0, &uc) || hostName[0] == L'\0') {
+    if (!WinHttpCrackUrl(wideUrl, 0, 0, &uc) || outHost[0] == L'\0') return false;
+
+    *outPort = uc.nPort;
+    *outSecure = (uc.nScheme == INTERNET_SCHEME_HTTPS);
+    size_t plen = wcslen(pathBuf);
+    while (plen > 0 && pathBuf[plen - 1] == L'/') pathBuf[--plen] = L'\0';
+    wcsncpy(outBasePath, pathBuf, outBasePathCap - 1);
+    outBasePath[outBasePathCap - 1] = L'\0';
+    return true;
+}
+
+static bool HttpRequestRelay(
+    const char* rawUrl,
+    const wchar_t* method,
+    const wchar_t* subPath,
+    const char* jsonBody,
+    DWORD* outStatusOrErr,
+    std::string* outRespBody
+) {
+    wchar_t hostName[160] = {};
+    wchar_t basePath[160] = {};
+    INTERNET_PORT port = INTERNET_DEFAULT_HTTPS_PORT;
+    bool isSecure = true;
+
+    if (!ParseRelayHttpTarget(rawUrl, hostName, 160, &port, &isSecure, basePath, 160, nullptr)) {
         *outStatusOrErr = ERROR_INVALID_PARAMETER;
         return false;
     }
 
-    size_t plen = wcslen(basePath);
-    while (plen > 0 && basePath[plen - 1] == L'/') {
-        basePath[--plen] = L'\0';
-    }
-    wchar_t healthPath[200] = {};
-    _snwprintf(healthPath, 200, L"%s/health", basePath);
-    healthPath[199] = L'\0';
-
-    bool isSecure = (uc.nScheme == INTERNET_SCHEME_HTTPS);
+    wchar_t fullPath[256] = {};
+    _snwprintf(fullPath, 256, L"%s%s", basePath, subPath);
+    fullPath[255] = L'\0';
 
     HINTERNET hSession = WinHttpOpen(
         L"PeggleOnlineLauncher/2.0",
@@ -411,28 +549,15 @@ static bool WakeRelayHealth(const char* rawUrl, DWORD* outStatusOrErr) {
         WINHTTP_NO_PROXY_BYPASS,
         0
     );
-    if (!hSession) {
-        *outStatusOrErr = GetLastError();
-        return false;
-    }
-
+    if (!hSession) { *outStatusOrErr = GetLastError(); return false; }
     WinHttpSetTimeouts(hSession, 10000, 15000, 15000, 45000);
 
-    HINTERNET hConnect = WinHttpConnect(hSession, hostName, uc.nPort, 0);
-    if (!hConnect) {
-        *outStatusOrErr = GetLastError();
-        WinHttpCloseHandle(hSession);
-        return false;
-    }
+    HINTERNET hConnect = WinHttpConnect(hSession, hostName, port, 0);
+    if (!hConnect) { *outStatusOrErr = GetLastError(); WinHttpCloseHandle(hSession); return false; }
 
     HINTERNET hRequest = WinHttpOpenRequest(
-        hConnect,
-        L"GET",
-        healthPath,
-        nullptr,
-        WINHTTP_NO_REFERER,
-        WINHTTP_DEFAULT_ACCEPT_TYPES,
-        isSecure ? WINHTTP_FLAG_SECURE : 0
+        hConnect, method, fullPath, nullptr, WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES, isSecure ? WINHTTP_FLAG_SECURE : 0
     );
     if (!hRequest) {
         *outStatusOrErr = GetLastError();
@@ -441,11 +566,13 @@ static bool WakeRelayHealth(const char* rawUrl, DWORD* outStatusOrErr) {
         return false;
     }
 
+    const wchar_t* hdrs = jsonBody ? L"Content-Type: application/json\r\n" : WINHTTP_NO_ADDITIONAL_HEADERS;
+    DWORD bodyLen = jsonBody ? (DWORD)strlen(jsonBody) : 0;
+
     bool ok = false;
-    if (WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+    if (WinHttpSendRequest(hRequest, hdrs, jsonBody ? (DWORD)-1 : 0, (LPVOID)jsonBody, bodyLen, bodyLen, 0) &&
         WinHttpReceiveResponse(hRequest, nullptr)) {
-        DWORD status = 0;
-        DWORD statusSz = sizeof(status);
+        DWORD status = 0, statusSz = sizeof(status);
         if (WinHttpQueryHeaders(
                 hRequest,
                 WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
@@ -455,6 +582,16 @@ static bool WakeRelayHealth(const char* rawUrl, DWORD* outStatusOrErr) {
                 WINHTTP_NO_HEADER_INDEX)) {
             *outStatusOrErr = status;
             ok = (status >= 200 && status < 300);
+        }
+        if (outRespBody) {
+            DWORD avail = 0;
+            while (WinHttpQueryDataAvailable(hRequest, &avail) && avail > 0) {
+                std::vector<char> buf(avail);
+                DWORD read = 0;
+                if (WinHttpReadData(hRequest, buf.data(), avail, &read) && read > 0) {
+                    outRespBody->append(buf.data(), read);
+                } else break;
+            }
         }
     } else {
         *outStatusOrErr = GetLastError();
@@ -466,12 +603,64 @@ static bool WakeRelayHealth(const char* rawUrl, DWORD* outStatusOrErr) {
     return ok;
 }
 
+struct WakeThreadArgs {
+    std::string relayUrl;
+};
+
 static DWORD WINAPI WakeServerThread(LPVOID param) {
     WakeThreadArgs* args = (WakeThreadArgs*)param;
     DWORD code = 0;
-    bool ok = WakeRelayHealth(args->relayUrl.c_str(), &code);
+    bool ok = HttpRequestRelay(args->relayUrl.c_str(), L"GET", L"/health", nullptr, &code, nullptr);
     delete args;
     PostMessageA(g_HwndMain, WM_APP_WAKE_DONE, ok ? 1 : 0, (LPARAM)code);
+    return 0;
+}
+
+struct CreateLbArgs {
+    std::string relayUrl;
+    std::string lbName;
+    std::string lbCode;
+};
+
+struct CreateLbResult {
+    bool ok = false;
+    DWORD status = 0;
+    std::string code;
+    std::string baseUrl;
+};
+
+static std::string ExtractJsonStringField(const std::string& json, const char* field) {
+    std::string pat = std::string("\"") + field + "\":\"";
+    size_t pos = json.find(pat);
+    if (pos == std::string::npos) return "";
+    size_t start = pos + pat.size();
+    size_t end = json.find('"', start);
+    if (end == std::string::npos) return "";
+    return json.substr(start, end - start);
+}
+
+static DWORD WINAPI CreateLbThread(LPVOID param) {
+    CreateLbArgs* args = (CreateLbArgs*)param;
+    char body[512];
+    if (args->lbCode.empty()) {
+        snprintf(body, sizeof(body), "{\"name\":\"%s\"}", args->lbName.c_str());
+    } else {
+        snprintf(body, sizeof(body), "{\"name\":\"%s\",\"code\":\"%s\",\"getOrCreate\":true}",
+                 args->lbName.c_str(), args->lbCode.c_str());
+    }
+
+    CreateLbResult* res = new CreateLbResult();
+    std::string resp;
+    res->ok = HttpRequestRelay(args->relayUrl.c_str(), L"POST", L"/api/leaderboards", body, &res->status, &resp);
+    if (res->ok) {
+        res->code = ExtractJsonStringField(resp, "code");
+    }
+    wchar_t h[160] = {}, bp[160] = {};
+    INTERNET_PORT port = 443;
+    bool sec = true;
+    ParseRelayHttpTarget(args->relayUrl.c_str(), h, 160, &port, &sec, bp, 160, &res->baseUrl);
+    delete args;
+    PostMessageA(g_HwndMain, WM_APP_CREATELB_DONE, 0, (LPARAM)res);
     return 0;
 }
 
@@ -519,8 +708,7 @@ static void OnBrowseGameDir() {
 }
 
 static void OnCopyRoomCode() {
-    char raw[32] = {};
-    char clean[32] = {};
+    char raw[32] = {}, clean[32] = {};
     GetWindowTextA(g_EditRoomCode, raw, sizeof(raw));
     SanitizeRoomCode(raw, clean, sizeof(clean));
     if (!clean[0]) {
@@ -528,28 +716,77 @@ static void OnCopyRoomCode() {
         return;
     }
     SetWindowTextA(g_EditRoomCode, clean);
+    CopyTextToClipboard(clean);
+    char msg[128];
+    snprintf(msg, sizeof(msg), "Room code %s copied! Send it to your friends.", clean);
+    SetStatusText(msg);
+}
 
-    if (OpenClipboard(g_HwndMain)) {
-        EmptyClipboard();
-        size_t len = strlen(clean) + 1;
-        HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, len);
-        if (hMem) {
-            void* ptr = GlobalLock(hMem);
-            memcpy(ptr, clean, len);
-            GlobalUnlock(hMem);
-            SetClipboardData(CF_TEXT, hMem);
-        }
-        CloseClipboard();
-        char msg[128];
-        snprintf(msg, sizeof(msg), "Room code %s copied! Send it to your friend.", clean);
-        SetStatusText(msg);
+static void OnCreateLeaderboard() {
+    if (g_Busy) return;
+    char relayUrl[256] = {};
+    GetWindowTextA(g_EditRelayUrl, relayUrl, sizeof(relayUrl));
+    TrimWhitespace(relayUrl);
+    if (!relayUrl[0]) {
+        MessageBoxA(g_HwndMain, "Please enter your Render relay server URL first.", "Relay URL Missing", MB_ICONWARNING);
+        return;
     }
+
+    char rawName[48] = {}, cleanName[48] = {};
+    GetWindowTextA(g_EditPlayerName, rawName, sizeof(rawName));
+    SanitizeDisplayName(rawName, cleanName, sizeof(cleanName));
+
+    char rawLb[32] = {}, cleanLb[32] = {};
+    GetWindowTextA(g_EditLbCode, rawLb, sizeof(rawLb));
+    SanitizeLbCode(rawLb, cleanLb, sizeof(cleanLb));
+
+    CreateLbArgs* args = new CreateLbArgs();
+    args->relayUrl = relayUrl;
+    args->lbCode = cleanLb;
+    if (cleanLb[0]) {
+        args->lbName = cleanLb;
+    } else {
+        args->lbName = std::string(cleanName) + " Club";
+    }
+
+    g_Busy = true;
+    SetUiEnabled(false);
+    SetStatusText("Creating leaderboard on Render server...");
+    HANDLE hThread = CreateThread(nullptr, 0, CreateLbThread, args, 0, nullptr);
+    if (hThread) CloseHandle(hThread);
+    else { delete args; g_Busy = false; SetUiEnabled(true); }
+}
+
+static void OnOpenLeaderboardWeb() {
+    char relayUrl[256] = {};
+    GetWindowTextA(g_EditRelayUrl, relayUrl, sizeof(relayUrl));
+    TrimWhitespace(relayUrl);
+    if (!relayUrl[0]) return;
+
+    wchar_t h[160] = {}, bp[160] = {};
+    INTERNET_PORT port = 443;
+    bool sec = true;
+    std::string normBase;
+    if (!ParseRelayHttpTarget(relayUrl, h, 160, &port, &sec, bp, 160, &normBase)) {
+        MessageBoxA(g_HwndMain, "Please enter a valid Relay Server URL.", "Invalid URL", MB_ICONWARNING);
+        return;
+    }
+
+    char rawLb[32] = {}, cleanLb[32] = {};
+    GetWindowTextA(g_EditLbCode, rawLb, sizeof(rawLb));
+    SanitizeLbCode(rawLb, cleanLb, sizeof(cleanLb));
+
+    std::string targetUrl = normBase + "/leaderboard";
+    if (cleanLb[0]) {
+        targetUrl += "/" + std::string(cleanLb);
+    }
+    ShellExecuteA(nullptr, "open", targetUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
 static std::string g_PendingLaunchDir;
 
 static void OnPlayOnline() {
-    if (g_Waking) return;
+    if (g_Busy) return;
 
     char gameDir[MAX_PATH] = {};
     GetWindowTextA(g_EditGameDir, gameDir, sizeof(gameDir));
@@ -569,17 +806,16 @@ static void OnPlayOnline() {
     GetWindowTextA(g_EditRelayUrl, relayUrl, sizeof(relayUrl));
     TrimWhitespace(relayUrl);
     if (!relayUrl[0]) {
-        MessageBoxA(
-            g_HwndMain,
-            "Please enter your Render relay server URL.",
-            "Relay URL Missing",
-            MB_ICONWARNING
-        );
+        MessageBoxA(g_HwndMain, "Please enter your Render relay server URL.", "Relay URL Missing", MB_ICONWARNING);
         return;
     }
 
-    char rawCode[32] = {};
-    char roomCode[32] = {};
+    char rawName[48] = {}, playerName[48] = {};
+    GetWindowTextA(g_EditPlayerName, rawName, sizeof(rawName));
+    SanitizeDisplayName(rawName, playerName, sizeof(playerName));
+    SetWindowTextA(g_EditPlayerName, playerName);
+
+    char rawCode[32] = {}, roomCode[32] = {};
     GetWindowTextA(g_EditRoomCode, rawCode, sizeof(rawCode));
     SanitizeRoomCode(rawCode, roomCode, sizeof(roomCode));
     if (strlen(roomCode) < 2) {
@@ -593,8 +829,14 @@ static void OnPlayOnline() {
     }
     SetWindowTextA(g_EditRoomCode, roomCode);
 
-    bool isHost = (SendMessageA(g_RadioHost, BM_GETCHECK, 0, 0) == BST_CHECKED);
-    const char* roleStr = isHost ? "ws_host" : "ws_client";
+    char rawLb[32] = {}, lbCode[32] = {};
+    GetWindowTextA(g_EditLbCode, rawLb, sizeof(rawLb));
+    SanitizeLbCode(rawLb, lbCode, sizeof(lbCode));
+    SetWindowTextA(g_EditLbCode, lbCode);
+
+    int modePlayers = Is2v2Selected() ? 4 : 2;
+    int playerSlot = GetSelectedSlot();
+    int ballsPerPlayer = GetSelectedBallsPerPlayer();
 
     char errBuf[512] = {};
     if (!InstallModToGameDir(gameDir, errBuf, sizeof(errBuf))) {
@@ -602,8 +844,8 @@ static void OnPlayOnline() {
         return;
     }
 
-    SaveRelayConfigIni(relayUrl, gameDir);
-    if (!WriteGameIni(gameDir, true, roleStr, relayUrl, roomCode)) {
+    SaveRelayConfigIni(relayUrl, gameDir, playerName, lbCode, modePlayers, ballsPerPlayer);
+    if (!WriteGameIni(gameDir, true, modePlayers, playerSlot, ballsPerPlayer, playerName, lbCode, relayUrl, roomCode)) {
         MessageBoxA(
             g_HwndMain,
             "Failed to write peggle_online.ini in the game folder.\nTry running as Administrator if the game is in Program Files.",
@@ -613,20 +855,19 @@ static void OnPlayOnline() {
         return;
     }
 
-    g_Waking = true;
+    g_Busy = true;
     g_PendingLaunchDir = gameDir;
     SetUiEnabled(false);
     SetStatusText("Waking up Render server (first load can take ~20s)...");
 
     WakeThreadArgs* args = new WakeThreadArgs();
     args->relayUrl = relayUrl;
-    args->gameDir = gameDir;
     HANDLE hThread = CreateThread(nullptr, 0, WakeServerThread, args, 0, nullptr);
     if (hThread) {
         CloseHandle(hThread);
     } else {
         delete args;
-        g_Waking = false;
+        g_Busy = false;
         SetUiEnabled(true);
         LaunchPeggleGame(gameDir);
     }
@@ -650,7 +891,7 @@ static void OnPlayOffline() {
         char relayUrl[256] = {};
         GetWindowTextA(g_EditRelayUrl, relayUrl, sizeof(relayUrl));
         TrimWhitespace(relayUrl);
-        WriteGameIni(gameDir, false, "ws_host", relayUrl[0] ? relayUrl : kDefaultRelayUrl, "PEGG");
+        WriteGameIni(gameDir, false, 2, 0, 6, "Player", "", relayUrl[0] ? relayUrl : kDefaultRelayUrl, "PEGG");
     }
 
     SetStatusText("Launching Peggle Nights in Offline mode...");
@@ -667,10 +908,7 @@ static void OnUninstallMod() {
         return;
     }
 
-    char dstDll[MAX_PATH];
-    char origDll[MAX_PATH];
-    char iniPath[MAX_PATH];
-    char logPath[MAX_PATH];
+    char dstDll[MAX_PATH], origDll[MAX_PATH], iniPath[MAX_PATH], logPath[MAX_PATH];
     snprintf(dstDll, sizeof(dstDll), "%s\\bass.dll", gameDir);
     snprintf(origDll, sizeof(origDll), "%s\\bass_orig.dll", gameDir);
     snprintf(iniPath, sizeof(iniPath), "%s\\peggle_online.ini", gameDir);
@@ -725,73 +963,113 @@ static void CreateUiControls(HWND hwnd) {
         return c;
     };
 
-    makeLabel("Peggle Nights Online Duel", 18, 14, 440, 26, g_FontTitle);
-    makeLabel("Auto-installs the mod and connects you & your friend with a Room Code.", 18, 42, 444, 20, g_FontNormal);
+    makeLabel("Peggle Nights Online Duel", 18, 14, 464, 26, g_FontTitle);
+    makeLabel("Auto-installs the mod & connects 1v1 or 2v2 with Room Codes + Leaderboards.", 18, 42, 464, 18, g_FontNormal);
 
-    makeLabel("Peggle Nights Folder:", 18, 72, 200, 18, g_FontBold);
+    makeLabel("Peggle Nights Folder:", 18, 70, 200, 18, g_FontBold);
     g_EditGameDir = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
         WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_READONLY,
-        S(18), S(93), S(356), S(24), hwnd, (HMENU)IDC_EDIT_GAMEDIR, nullptr, nullptr);
+        S(18), S(90), S(366), S(24), hwnd, (HMENU)IDC_EDIT_GAMEDIR, nullptr, nullptr);
     SendMessageA(g_EditGameDir, WM_SETFONT, (WPARAM)g_FontNormal, TRUE);
 
     g_BtnBrowse = CreateWindowExA(0, "BUTTON", "Browse...",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-        S(382), S(92), S(82), S(26), hwnd, (HMENU)IDC_BTN_BROWSE, nullptr, nullptr);
+        S(392), S(89), S(90), S(26), hwnd, (HMENU)IDC_BTN_BROWSE, nullptr, nullptr);
     SendMessageA(g_BtnBrowse, WM_SETFONT, (WPARAM)g_FontNormal, TRUE);
 
-    makeLabel("Relay Server URL (Render):", 18, 128, 250, 18, g_FontBold);
+    makeLabel("Relay Server URL (Render):", 18, 124, 250, 18, g_FontBold);
     g_EditRelayUrl = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-        S(18), S(149), S(446), S(24), hwnd, (HMENU)IDC_EDIT_RELAYURL, nullptr, nullptr);
+        S(18), S(144), S(464), S(24), hwnd, (HMENU)IDC_EDIT_RELAYURL, nullptr, nullptr);
     SendMessageA(g_EditRelayUrl, WM_SETFONT, (WPARAM)g_FontNormal, TRUE);
 
-    makeLabel("Your Role:", 18, 184, 150, 18, g_FontBold);
-    g_RadioHost = CreateWindowExA(0, "BUTTON", "Host a Match (Player 1)",
+    makeLabel("Your Name:", 18, 178, 150, 18, g_FontBold);
+    g_EditPlayerName = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+        S(18), S(198), S(220), S(24), hwnd, (HMENU)IDC_EDIT_PLAYERNAME, nullptr, nullptr);
+    SendMessageA(g_EditPlayerName, EM_LIMITTEXT, 24, 0);
+    SendMessageA(g_EditPlayerName, WM_SETFONT, (WPARAM)g_FontNormal, TRUE);
+
+    makeLabel("Mode:", 252, 178, 150, 18, g_FontBold);
+    g_Radio1v1 = CreateWindowExA(0, "BUTTON", "1v1 (2 Players)",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTORADIOBUTTON | WS_GROUP,
-        S(18), S(205), S(210), S(22), hwnd, (HMENU)IDC_RADIO_HOST, nullptr, nullptr);
-    SendMessageA(g_RadioHost, WM_SETFONT, (WPARAM)g_FontNormal, TRUE);
+        S(252), S(200), S(112), S(22), hwnd, (HMENU)IDC_RADIO_1V1, nullptr, nullptr);
+    SendMessageA(g_Radio1v1, WM_SETFONT, (WPARAM)g_FontNormal, TRUE);
 
-    g_RadioJoin = CreateWindowExA(0, "BUTTON", "Join a Match (Player 2)",
+    g_Radio2v2 = CreateWindowExA(0, "BUTTON", "2v2 (4 Players)",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTORADIOBUTTON,
-        S(240), S(205), S(210), S(22), hwnd, (HMENU)IDC_RADIO_JOIN, nullptr, nullptr);
-    SendMessageA(g_RadioJoin, WM_SETFONT, (WPARAM)g_FontNormal, TRUE);
-    SendMessageA(g_RadioHost, BM_SETCHECK, BST_CHECKED, 0);
+        S(368), S(200), S(114), S(22), hwnd, (HMENU)IDC_RADIO_2V2, nullptr, nullptr);
+    SendMessageA(g_Radio2v2, WM_SETFONT, (WPARAM)g_FontNormal, TRUE);
 
-    makeLabel("Room Code (share this 4-letter code with your friend):", 18, 238, 400, 18, g_FontBold);
+    makeLabel("Your Role / Team Slot:", 18, 232, 200, 18, g_FontBold);
+    g_ComboSlot = CreateWindowExA(0, "COMBOBOX", "",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+        S(18), S(252), S(220), S(140), hwnd, (HMENU)IDC_COMBO_SLOT, nullptr, nullptr);
+    SendMessageA(g_ComboSlot, WM_SETFONT, (WPARAM)g_FontNormal, TRUE);
+
+    makeLabel("Balls per Player (Host sets):", 252, 232, 220, 18, g_FontBold);
+    g_ComboBalls = CreateWindowExA(0, "COMBOBOX", "",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+        S(252), S(252), S(230), S(140), hwnd, (HMENU)IDC_COMBO_BALLS, nullptr, nullptr);
+    SendMessageA(g_ComboBalls, WM_SETFONT, (WPARAM)g_FontNormal, TRUE);
+    SendMessageA(g_ComboBalls, CB_ADDSTRING, 0, (LPARAM)"3 Balls / Player (2v2: 6/team)");
+    SendMessageA(g_ComboBalls, CB_ADDSTRING, 0, (LPARAM)"4 Balls / Player (Recommended)");
+    SendMessageA(g_ComboBalls, CB_ADDSTRING, 0, (LPARAM)"5 Balls / Player (2v2: 10/team)");
+    SendMessageA(g_ComboBalls, CB_ADDSTRING, 0, (LPARAM)"6 Balls / Player (Classic 1v1)");
+
+    makeLabel("Room Code (share this 4-letter code with your friends):", 18, 288, 430, 18, g_FontBold);
     g_EditRoomCode = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_UPPERCASE | ES_CENTER,
-        S(18), S(260), S(150), S(30), hwnd, (HMENU)IDC_EDIT_ROOMCODE, nullptr, nullptr);
+        S(18), S(309), S(150), S(30), hwnd, (HMENU)IDC_EDIT_ROOMCODE, nullptr, nullptr);
     SendMessageA(g_EditRoomCode, EM_LIMITTEXT, 12, 0);
     SendMessageA(g_EditRoomCode, WM_SETFONT, (WPARAM)g_FontCode, TRUE);
 
     g_BtnNewCode = CreateWindowExA(0, "BUTTON", "New Code",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-        S(178), S(260), S(96), S(30), hwnd, (HMENU)IDC_BTN_NEWCODE, nullptr, nullptr);
+        S(178), S(309), S(100), S(30), hwnd, (HMENU)IDC_BTN_NEWCODE, nullptr, nullptr);
     SendMessageA(g_BtnNewCode, WM_SETFONT, (WPARAM)g_FontNormal, TRUE);
 
     g_BtnCopyCode = CreateWindowExA(0, "BUTTON", "Copy Code",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-        S(282), S(260), S(96), S(30), hwnd, (HMENU)IDC_BTN_COPYCODE, nullptr, nullptr);
+        S(286), S(309), S(100), S(30), hwnd, (HMENU)IDC_BTN_COPYCODE, nullptr, nullptr);
     SendMessageA(g_BtnCopyCode, WM_SETFONT, (WPARAM)g_FontNormal, TRUE);
 
-    g_StaticStatus = makeLabel("Ready! Click 'Play Online Duel!' to install & launch.", 18, 304, 446, 36, g_FontNormal, IDC_STATIC_STATUS);
+    makeLabel("Custom Leaderboard Code (optional - tracks wins & scores online):", 18, 350, 464, 18, g_FontBold);
+    g_EditLbCode = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_UPPERCASE | ES_AUTOHSCROLL,
+        S(18), S(371), S(210), S(26), hwnd, (HMENU)IDC_EDIT_LBCODE, nullptr, nullptr);
+    SendMessageA(g_EditLbCode, EM_LIMITTEXT, 16, 0);
+    SendMessageA(g_EditLbCode, WM_SETFONT, (WPARAM)g_FontNormal, TRUE);
+
+    g_BtnCreateLb = CreateWindowExA(0, "BUTTON", "Create New",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        S(236), S(371), S(118), S(26), hwnd, (HMENU)IDC_BTN_CREATELB, nullptr, nullptr);
+    SendMessageA(g_BtnCreateLb, WM_SETFONT, (WPARAM)g_FontNormal, TRUE);
+
+    g_BtnOpenLb = CreateWindowExA(0, "BUTTON", "Open Web",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        S(362), S(371), S(120), S(26), hwnd, (HMENU)IDC_BTN_OPENLB, nullptr, nullptr);
+    SendMessageA(g_BtnOpenLb, WM_SETFONT, (WPARAM)g_FontNormal, TRUE);
+
+    g_StaticStatus = makeLabel("Ready! Click 'Play Online Duel!' to install & launch.",
+        18, 408, 464, 38, g_FontNormal, IDC_STATIC_STATUS);
 
     g_BtnPlayOnline = CreateWindowExA(0, "BUTTON", "Play Online Duel!",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-        S(18), S(348), S(190), S(36), hwnd, (HMENU)IDC_BTN_PLAY_ONLINE, nullptr, nullptr);
+        S(18), S(454), S(206), S(38), hwnd, (HMENU)IDC_BTN_PLAY_ONLINE, nullptr, nullptr);
     SendMessageA(g_BtnPlayOnline, WM_SETFONT, (WPARAM)g_FontBold, TRUE);
 
     g_BtnPlayOffline = CreateWindowExA(0, "BUTTON", "Play Offline",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-        S(218), S(348), S(118), S(36), hwnd, (HMENU)IDC_BTN_PLAY_OFF, nullptr, nullptr);
+        S(234), S(454), S(120), S(38), hwnd, (HMENU)IDC_BTN_PLAY_OFF, nullptr, nullptr);
     SendMessageA(g_BtnPlayOffline, WM_SETFONT, (WPARAM)g_FontNormal, TRUE);
 
     g_BtnUninstall = CreateWindowExA(0, "BUTTON", "Uninstall Mod",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-        S(346), S(348), S(118), S(36), hwnd, (HMENU)IDC_BTN_UNINSTALL, nullptr, nullptr);
+        S(362), S(454), S(120), S(38), hwnd, (HMENU)IDC_BTN_UNINSTALL, nullptr, nullptr);
     SendMessageA(g_BtnUninstall, WM_SETFONT, (WPARAM)g_FontNormal, TRUE);
 
-    // Populate initial values
+    // Populate initial values from relay_config.ini
     char detectedDir[MAX_PATH] = {};
     if (DetectPeggleNightsDir(detectedDir, sizeof(detectedDir))) {
         SetWindowTextA(g_EditGameDir, detectedDir);
@@ -804,6 +1082,31 @@ static void CreateUiControls(HWND hwnd) {
     GetPrivateProfileStringA("Relay", "relay_url", kDefaultRelayUrl, relayUrl, sizeof(relayUrl), g_RelayConfigIni);
     TrimWhitespace(relayUrl);
     SetWindowTextA(g_EditRelayUrl, relayUrl[0] ? relayUrl : kDefaultRelayUrl);
+
+    char defaultUser[48] = "Player";
+    DWORD unLen = sizeof(defaultUser);
+    GetUserNameA(defaultUser, &unLen);
+    char playerName[48] = {};
+    GetPrivateProfileStringA("Relay", "player_name", defaultUser, playerName, sizeof(playerName), g_RelayConfigIni);
+    SanitizeDisplayName(playerName, playerName, sizeof(playerName));
+    SetWindowTextA(g_EditPlayerName, playerName);
+
+    char lbCode[32] = {};
+    GetPrivateProfileStringA("Relay", "leaderboard_code", "", lbCode, sizeof(lbCode), g_RelayConfigIni);
+    SanitizeLbCode(lbCode, lbCode, sizeof(lbCode));
+    SetWindowTextA(g_EditLbCode, lbCode);
+
+    int savedMode = GetPrivateProfileIntA("Relay", "mode_players", 2, g_RelayConfigIni);
+    bool is2v2 = (savedMode == 4);
+    SendMessageA(is2v2 ? g_Radio2v2 : g_Radio1v1, BM_SETCHECK, BST_CHECKED, 0);
+    PopulateSlotCombo(is2v2, 0);
+
+    int savedBalls = GetPrivateProfileIntA("Relay", "balls_per_player", 4, g_RelayConfigIni);
+    int ballIdx = 1;
+    if (savedBalls == 3) ballIdx = 0;
+    else if (savedBalls == 5) ballIdx = 2;
+    else if (savedBalls == 6) ballIdx = 3;
+    SendMessageA(g_ComboBalls, CB_SETCURSEL, (WPARAM)ballIdx, 0);
 
     char roomCode[16] = {};
     GenerateRandomRoomCode(roomCode, sizeof(roomCode));
@@ -835,18 +1138,19 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             SetStatusText("Generated a new room code.");
         } else if (id == IDC_BTN_COPYCODE && code == BN_CLICKED) {
             OnCopyRoomCode();
-        } else if (id == IDC_RADIO_HOST && code == BN_CLICKED) {
-            char cur[32] = {};
-            GetWindowTextA(g_EditRoomCode, cur, sizeof(cur));
-            TrimWhitespace(cur);
-            if (!cur[0]) {
-                char roomCode[16] = {};
-                GenerateRandomRoomCode(roomCode, sizeof(roomCode));
-                SetWindowTextA(g_EditRoomCode, roomCode);
-            }
-            SetStatusText("Hosting as Player 1. Share the Room Code with your friend!");
-        } else if (id == IDC_RADIO_JOIN && code == BN_CLICKED) {
-            SetStatusText("Joining as Player 2. Paste your friend's Room Code above.");
+        } else if ((id == IDC_RADIO_1V1 || id == IDC_RADIO_2V2) && code == BN_CLICKED) {
+            bool is2v2 = Is2v2Selected();
+            PopulateSlotCombo(is2v2, GetSelectedSlot());
+            SetStatusText(is2v2
+                ? "2v2 Team Duel selected! Share the Room Code with 3 friends."
+                : "1v1 Duel selected! Share the Room Code with your friend.");
+        } else if (id == IDC_COMBO_SLOT && code == CBN_SELCHANGE) {
+            int slot = GetSelectedSlot();
+            EnableWindow(g_ComboBalls, !g_Busy && slot == 0);
+        } else if (id == IDC_BTN_CREATELB && code == BN_CLICKED) {
+            OnCreateLeaderboard();
+        } else if (id == IDC_BTN_OPENLB && code == BN_CLICKED) {
+            OnOpenLeaderboardWeb();
         } else if (id == IDC_BTN_PLAY_ONLINE && code == BN_CLICKED) {
             OnPlayOnline();
         } else if (id == IDC_BTN_PLAY_OFF && code == BN_CLICKED) {
@@ -858,7 +1162,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     }
 
     case WM_APP_WAKE_DONE: {
-        g_Waking = false;
+        g_Busy = false;
         SetUiEnabled(true);
         if (wParam == 1) {
             SetStatusText("Server awake! Launching Peggle Nights...");
@@ -870,14 +1174,48 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                 "If your Render server is still booting up, launching anyway is fine—the mod keeps retrying automatically.\n\n"
                 "Launch Peggle Nights anyway?",
                 (unsigned int)lParam);
-            int choice = MessageBoxA(hwnd, msg, "Relay Server Wake Check", MB_YESNO | MB_ICONWARNING);
-            if (choice == IDYES) {
+            if (MessageBoxA(hwnd, msg, "Relay Server Wake Check", MB_YESNO | MB_ICONWARNING) == IDYES) {
                 SetStatusText("Launching Peggle Nights (mod will keep connecting in background)...");
                 LaunchPeggleGame(g_PendingLaunchDir.c_str());
             } else {
                 SetStatusText("Ready. Check your Relay Server URL or try again.");
             }
         }
+        return 0;
+    }
+
+    case WM_APP_CREATELB_DONE: {
+        g_Busy = false;
+        SetUiEnabled(true);
+        CreateLbResult* res = (CreateLbResult*)lParam;
+        if (res && res->ok && !res->code.empty()) {
+            SetWindowTextA(g_EditLbCode, res->code.c_str());
+            WritePrivateProfileStringA("Relay", "leaderboard_code", res->code.c_str(), g_RelayConfigIni);
+            std::string fullUrl = res->baseUrl + "/leaderboard/" + res->code;
+            CopyTextToClipboard(fullUrl.c_str());
+
+            char st[256];
+            snprintf(st, sizeof(st), "Leaderboard %s ready! Web link copied to clipboard.", res->code.c_str());
+            SetStatusText(st);
+
+            char msg[384];
+            snprintf(msg, sizeof(msg),
+                "Custom leaderboard '%s' is ready!\n\n"
+                "Share this code with your friends: %s\n"
+                "Link (copied to clipboard): %s\n\n"
+                "Open it in your browser now?",
+                res->code.c_str(), res->code.c_str(), fullUrl.c_str());
+            if (MessageBoxA(hwnd, msg, "Leaderboard Ready!", MB_YESNO | MB_ICONINFORMATION) == IDYES) {
+                ShellExecuteA(nullptr, "open", fullUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            }
+        } else {
+            char msg[256];
+            snprintf(msg, sizeof(msg), "Could not create leaderboard right now (status %u).\nIf Render is asleep, click Play Online or retry in a few seconds.",
+                     res ? (unsigned int)res->status : 0);
+            MessageBoxA(hwnd, msg, "Leaderboard Error", MB_ICONWARNING);
+            SetStatusText("Could not reach server to create leaderboard.");
+        }
+        delete res;
         return 0;
     }
 
@@ -913,7 +1251,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE /*hPrev*/, LPSTR /*lpCmd*/, int nC
     RegisterClassExA(&wc);
 
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    RECT rc = { 0, 0, S(482), S(404) };
+    RECT rc = { 0, 0, S(500), S(510) };
     AdjustWindowRectEx(&rc, style, FALSE, 0);
 
     HWND hwnd = CreateWindowExA(

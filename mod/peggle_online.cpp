@@ -226,16 +226,17 @@ DEFINE_BASS_THUNK(94, _)
 // ============================================================================
 // 2. Reverse-Engineered Peggle Nights (Steam) Addresses & Engine Calls
 // ============================================================================
-static constexpr uintptr_t ADDR_G_SEXY_APP_BASE    = 0x006cbe04;
-static constexpr uintptr_t ADDR_APP_VTABLE         = 0x0068670c;
-static constexpr uintptr_t ADDR_BOARD_VTABLE       = 0x006864a4;
-static constexpr uintptr_t ADDR_MT_STATE           = 0x00704268; // 624 uint32 + 1 uint32 index = 2500 bytes
-static constexpr size_t    MT_STATE_BYTES          = 2500;
+static constexpr uintptr_t ADDR_G_SEXY_APP_BASE       = 0x006cbe04;
+static constexpr uintptr_t ADDR_APP_VTABLE            = 0x0068670c;
+static constexpr uintptr_t ADDR_BOARD_VTABLE          = 0x006864a4;
+static constexpr uintptr_t ADDR_MT_STATE              = 0x00704268; // 624 uint32 + 1 uint32 index = 2500 bytes
+static constexpr size_t    MT_STATE_BYTES             = 2500;
 
-static constexpr uintptr_t ADDR_FN_BOARD_SAVESTATE = 0x00405d00;
-static constexpr uintptr_t ADDR_FN_BOARD_LOADSTATE = 0x00405db0;
-static constexpr uintptr_t ADDR_FN_GUN_SETANGLE    = 0x00498c50;
-static constexpr uintptr_t ADDR_FN_CALC_MOUSE_AIM  = 0x00468940;
+static constexpr uintptr_t ADDR_FN_BOARD_SAVESTATE    = 0x00405d00;
+static constexpr uintptr_t ADDR_FN_BOARD_LOADSTATE    = 0x00405db0;
+static constexpr uintptr_t ADDR_FN_IFACE_SETNUMBALLS  = 0x00463c10;
+static constexpr uintptr_t ADDR_FN_CALC_MOUSE_AIM     = 0x00468940;
+static constexpr uintptr_t ADDR_FN_GUN_SETANGLE       = 0x00498c50;
 
 struct FakeBuffer {
     uint32_t pad0;
@@ -305,6 +306,18 @@ static void Engine_Logic_CalcMouseAim(void* logic) {
     }
 }
 
+static void Engine_Interface_SetNumBalls(void* iface, int numBalls) {
+    if (!iface) return;
+    uint32_t fn = ADDR_FN_IFACE_SETNUMBALLS;
+    __asm {
+        push ebx
+        mov eax, numBalls
+        mov ebx, iface
+        call fn
+        pop ebx
+    }
+}
+
 // ============================================================================
 // 3. Mod Configuration & Network Protocol
 // ============================================================================
@@ -313,19 +326,24 @@ enum NetRole {
     ROLE_CLIENT       = 1, // Direct TCP Connect (Player 2)
     ROLE_RELAY_HOST   = 2, // Outbound TCP to Relay Server (Player 1)
     ROLE_RELAY_CLIENT = 3, // Outbound TCP to Relay Server (Player 2)
-    ROLE_WS_HOST      = 4, // WebSocket Room Relay (Player 1)
-    ROLE_WS_CLIENT    = 5  // WebSocket Room Relay (Player 2)
+    ROLE_WS_HOST      = 4, // WebSocket Room Relay (Slot 0)
+    ROLE_WS_CLIENT    = 5  // WebSocket Room Relay (Slots 1..3)
 };
 
-static bool     g_ModEnabled      = true;
-static NetRole  g_Role            = ROLE_HOST;
-static int      g_LocalPlayerIdx  = 0; // 0 = Player 1 (Host), 1 = Player 2 (Client)
-static char     g_HostIp[128]     = "127.0.0.1";
-static int      g_Port            = 27888;
-static char     g_RelayUrl[256]   = "";
-static char     g_RoomCode[32]    = "PEGG";
-static char     g_ModDir[MAX_PATH]= { 0 };
-static FILE*    g_LogFile         = nullptr;
+static bool     g_ModEnabled          = true;
+static NetRole  g_Role                = ROLE_HOST;
+static int      g_ModePlayers         = 2;     // 2 = 1v1, 4 = 2v2
+static int      g_LocalPlayerSlot     = 0;     // 0..3 (team = slot % 2)
+static int      g_LocalPlayerIdx      = 0;     // Mirror of g_LocalPlayerSlot
+static int      g_BallsPerPlayer      = 0;     // 0 = vanilla default, 3..6 = custom
+static char     g_PlayerName[48]      = "Player";
+static char     g_LeaderboardCode[32] = "";
+static char     g_HostIp[128]         = "127.0.0.1";
+static int      g_Port                = 27888;
+static char     g_RelayUrl[256]       = "";
+static char     g_RoomCode[32]        = "PEGG";
+static char     g_ModDir[MAX_PATH]    = { 0 };
+static FILE*    g_LogFile             = nullptr;
 
 static void LogMsg(const char* fmt, ...) {
     if (!g_LogFile) return;
@@ -341,7 +359,8 @@ enum PacketType : uint8_t {
     PKT_STATE_SYNC   = 1, // [uint8_t isInitial][2500B MT][uint32_t len][len B BoardState]
     PKT_AIM          = 2, // [float angle]
     PKT_FIRE         = 3, // [float angle][2500B MT]
-    PKT_FLIGHT_CLICK = 4  // [uint8_t isDown][int32_t clickCount][int32_t x][int32_t y]
+    PKT_FLIGHT_CLICK = 4, // [uint8_t isDown][int32_t clickCount][int32_t x][int32_t y]
+    PKT_MATCH_RESULT = 5  // [UTF-8 JSON leaderboard match payload]
 };
 
 struct QueuedStateSync {
@@ -368,14 +387,16 @@ struct QueuedClick {
 static std::mutex               g_NetMutex;
 static std::mutex               g_SendMutex;
 static std::mutex               g_HudMutex;
-static SOCKET                   g_PeerSock        = INVALID_SOCKET;
-static HINTERNET                g_WsHandle        = nullptr;
-static volatile bool            g_RelayOnline     = false;
-static volatile bool            g_Connected       = false;
-static volatile bool            g_WantReconnect   = false;
-static bool                     g_PeerJustJoined  = false;
-static bool                     g_HasRemoteAim    = false;
-static float                    g_RemoteAimAngle  = 0.0f;
+static SOCKET                   g_PeerSock           = INVALID_SOCKET;
+static HINTERNET                g_WsHandle           = nullptr;
+static volatile bool            g_RelayOnline        = false;
+static volatile bool            g_Connected          = false;
+static volatile bool            g_WantReconnect      = false;
+static volatile int             g_RoomConnectedCount = 0;
+static volatile int             g_RoomMaxPlayers     = 2;
+static bool                     g_PeerJustJoined     = false;
+static bool                     g_HasRemoteAim       = false;
+static float                    g_RemoteAimAngle     = 0.0f;
 static QueuedStateSync          g_PendingSync;
 static QueuedFire               g_PendingFire;
 static std::vector<QueuedClick> g_PendingClicks;
@@ -413,6 +434,7 @@ static void CloseActiveTransport() {
     }
     g_Connected = false;
     g_RelayOnline = false;
+    g_RoomConnectedCount = 0;
     if (wsToClose) {
         WinHttpCloseHandle(wsToClose);
     }
@@ -445,7 +467,7 @@ static bool RecvAll(SOCKET s, void* buf, int len) {
 
 static void SendPacket(uint8_t type, const void* payload, uint32_t len) {
     std::lock_guard<std::mutex> lock(g_SendMutex);
-    if (!g_Connected) return;
+    if (!g_Connected && !(type == PKT_MATCH_RESULT && g_WsHandle != nullptr)) return;
 
     if (g_WsHandle != nullptr) {
         std::vector<uint8_t> msg(5 + len);
@@ -465,6 +487,7 @@ static void SendPacket(uint8_t type, const void* payload, uint32_t len) {
             g_WsHandle = nullptr;
             g_Connected = false;
             g_RelayOnline = false;
+            g_RoomConnectedCount = 0;
             WinHttpCloseHandle(h);
         }
         return;
@@ -516,6 +539,24 @@ static void HandleIncomingPacket(uint8_t type, const uint8_t* data, uint32_t len
     }
 }
 
+static void UrlEncodeParam(const char* src, char* dst, size_t cap) {
+    static const char kHex[] = "0123456789ABCDEF";
+    size_t w = 0;
+    for (size_t i = 0; src && src[i] && w + 1 < cap; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            dst[w++] = (char)c;
+        } else if (w + 3 < cap) {
+            dst[w++] = '%';
+            dst[w++] = kHex[(c >> 4) & 0xf];
+            dst[w++] = kHex[c & 0xf];
+        } else {
+            break;
+        }
+    }
+    dst[w] = '\0';
+}
+
 static bool BuildRelayUrlComponents(
     const char* rawUrl,
     wchar_t* outHost,
@@ -556,7 +597,6 @@ static bool BuildRelayUrlComponents(
     *outPort = uc.nPort;
     *outSecure = (uc.nScheme == INTERNET_SCHEME_HTTPS);
 
-    // Trim trailing slashes from any base path
     size_t plen = wcslen(pathBuf);
     while (plen > 0 && pathBuf[plen - 1] == L'/') {
         pathBuf[--plen] = L'\0';
@@ -578,13 +618,23 @@ static void RunWebSocketSession() {
         return;
     }
 
-    wchar_t wideRoom[64] = {};
-    MultiByteToWideChar(CP_ACP, 0, g_RoomCode, -1, wideRoom, 64);
-    const wchar_t* roleParam = (g_Role == ROLE_WS_HOST) ? L"host" : L"client";
+    char encodedName[160] = {};
+    UrlEncodeParam(g_PlayerName, encodedName, sizeof(encodedName));
 
-    wchar_t wsPath[320] = {};
-    _snwprintf(wsPath, 320, L"%s/ws?room=%s&role=%s", basePath, wideRoom, roleParam);
-    wsPath[319] = L'\0';
+    wchar_t wideRoom[64] = {};
+    wchar_t wideName[160] = {};
+    wchar_t wideLb[64] = {};
+    MultiByteToWideChar(CP_ACP, 0, g_RoomCode, -1, wideRoom, 64);
+    MultiByteToWideChar(CP_ACP, 0, encodedName, -1, wideName, 160);
+    MultiByteToWideChar(CP_ACP, 0, g_LeaderboardCode, -1, wideLb, 64);
+
+    wchar_t wsPath[512] = {};
+    _snwprintf(
+        wsPath, 512,
+        L"%s/ws?room=%s&slot=%d&max=%d&name=%s&lb=%s",
+        basePath, wideRoom, g_LocalPlayerSlot, g_ModePlayers, wideName, wideLb
+    );
+    wsPath[511] = L'\0';
 
     HINTERNET hSession = WinHttpOpen(
         L"PeggleOnline/2.0",
@@ -599,7 +649,6 @@ static void RunWebSocketSession() {
         return;
     }
 
-    // Generous 45s receive timeout for Render cold-start HTTP upgrade
     WinHttpSetTimeouts(hSession, 10000, 15000, 15000, 45000);
 
     HINTERNET hConnect = WinHttpConnect(hSession, hostName, port, 0);
@@ -676,7 +725,6 @@ static void RunWebSocketSession() {
         return;
     }
 
-    // Infinite receive timeout so turns never time out while aiming
     DWORD infTimeout = 0;
     WinHttpSetOption(hWs, WINHTTP_OPTION_RECEIVE_TIMEOUT, &infTimeout, sizeof(infTimeout));
     WinHttpSetTimeouts(hWs, 0, 0, 0, 0);
@@ -691,8 +739,10 @@ static void RunWebSocketSession() {
         }
         g_WsHandle = hWs;
         g_RelayOnline = true;
+        g_RoomMaxPlayers = g_ModePlayers;
     }
-    LogMsg("Connected to WebSocket relay in room %s (%s)", g_RoomCode, (g_Role == ROLE_WS_HOST) ? "host" : "client");
+    LogMsg("Connected to WebSocket relay room=%s slot=%d/%d name=%s lb=%s",
+           g_RoomCode, g_LocalPlayerSlot, g_ModePlayers, g_PlayerName, g_LeaderboardCode);
 
     std::vector<uint8_t> rxChunk(65536);
     std::vector<uint8_t> msgBuf;
@@ -725,17 +775,20 @@ static void RunWebSocketSession() {
             msgBuf.insert(msgBuf.end(), rxChunk.data(), rxChunk.data() + bytesRead);
 
             if (bufType == WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE) {
-                if (msgBuf.size() == 4 && memcmp(msgBuf.data(), "PGOK", 4) == 0) {
+                if (msgBuf.size() == 7 && memcmp(msgBuf.data(), "PGST", 4) == 0) {
+                    g_RoomConnectedCount = (int)msgBuf[4];
+                    g_RoomMaxPlayers = (int)msgBuf[5];
+                } else if (msgBuf.size() == 4 && memcmp(msgBuf.data(), "PGOK", 4) == 0) {
                     {
                         std::lock_guard<std::mutex> lock(g_NetMutex);
                         g_Connected = true;
                         g_PeerJustJoined = true;
                     }
-                    LogMsg("Friend joined room %s (PGOK)!", g_RoomCode);
+                    LogMsg("Room %s ready (%d/%d players -> PGOK)!", g_RoomCode, (int)g_RoomConnectedCount, (int)g_RoomMaxPlayers);
                     MessageBeep(MB_OK);
                 } else if (msgBuf.size() == 4 && memcmp(msgBuf.data(), "PGBY", 4) == 0) {
                     g_Connected = false;
-                    LogMsg("Friend left room %s (PGBY).", g_RoomCode);
+                    LogMsg("A player left room %s (PGBY).", g_RoomCode);
                 } else if (msgBuf.size() >= 5) {
                     uint8_t type = msgBuf[0];
                     uint32_t plen = 0;
@@ -759,6 +812,7 @@ static void RunWebSocketSession() {
     }
     g_Connected = false;
     g_RelayOnline = false;
+    g_RoomConnectedCount = 0;
     if (handleToClose) {
         WinHttpCloseHandle(handleToClose);
     }
@@ -801,7 +855,6 @@ static DWORD WINAPI NetworkThreadProc(LPVOID) {
             }
             LogMsg("Host listening on port %d...", g_Port);
 
-            // Poll accept with select so F6/F7 can interrupt cleanly
             while (!g_WantReconnect) {
                 fd_set rfds;
                 FD_ZERO(&rfds);
@@ -815,7 +868,6 @@ static DWORD WINAPI NetworkThreadProc(LPVOID) {
             }
             closesocket(listenSock);
         } else {
-            // Client or legacy TCP Relay connection
             while (!g_WantReconnect) {
                 SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
                 sockaddr_in addr = {};
@@ -859,7 +911,6 @@ static DWORD WINAPI NetworkThreadProc(LPVOID) {
         LogMsg("Peer connected!");
         MessageBeep(MB_OK);
 
-        // Receive loop
         while (!g_WantReconnect) {
             uint8_t hdr[5];
             if (!RecvAll(peer, hdr, 5)) break;
@@ -922,17 +973,30 @@ static FnBoardKeyUp      Orig_Board_KeyUp      = nullptr;
 static FnAppFocus        Orig_App_GotFocus     = nullptr;
 static FnAppFocus        Orig_App_LostFocus    = nullptr;
 
-static bool     g_AllowRemoteInput = false;
-static void*    g_LastBoard        = nullptr;
-static uint8_t  g_PrevCharDlgOpen  = 1;
-static int      g_PrevLogicState   = 0;
-static bool     g_ShotSentThisTurn = false;
-static bool     g_LocalWasShooting = false;
-static float    g_LastSentAngle    = -999.0f;
-static DWORD    g_LastAimSendMs    = 0;
-static DWORD    g_LastTitleMs      = 0;
+static bool     g_AllowRemoteInput  = false;
+static void*    g_LastBoard         = nullptr;
+static uint8_t  g_PrevCharDlgOpen   = 1;
+static int      g_PrevLogicState    = 0;
+static bool     g_ShotSentThisTurn  = false;
+static bool     g_LocalWasShooting  = false;
+static bool     g_MatchBallsApplied = false;
+static bool     g_MatchResultSent   = false;
+static int      g_MatchSeq          = 0;
+static float    g_LastSentAngle     = -999.0f;
+static DWORD    g_LastAimSendMs     = 0;
+static DWORD    g_LastTitleMs       = 0;
 
-static bool IsOnlineDuelActive(void* board, void** outLogic = nullptr, int* outCurPlayer = nullptr) {
+static int GetActivePlayerSlot(void* logic) {
+    if (!logic) return 0;
+    int curTeam = *(int*)((char*)logic + 0x1ac); // 0 = Team A (Left), 1 = Team B (Right)
+    if (g_ModePlayers <= 2) return curTeam;
+    int state = *(int*)((char*)logic + 0x4);
+    int teamShots = *(int*)((char*)logic + 0x2dc + curTeam * 0x7c);
+    int idx = (state == 1) ? teamShots : (teamShots > 0 ? teamShots - 1 : 0);
+    return (idx % 2 == 0) ? curTeam : (curTeam + 2);
+}
+
+static bool IsOnlineDuelActive(void* board, void** outLogic = nullptr, int* outActiveSlot = nullptr) {
     if (!g_ModEnabled || !g_Connected || !board) return false;
     int gameMode = *(int*)((char*)board + 0xb4);
     uint8_t charDlgOpen = *(uint8_t*)((char*)board + 0x106);
@@ -942,15 +1006,15 @@ static bool IsOnlineDuelActive(void* board, void** outLogic = nullptr, int* outC
     if (gameMode != 3 || charDlgOpen != 0 || isReplay != 0) return false;
 
     if (outLogic) *outLogic = logic;
-    if (outCurPlayer) *outCurPlayer = *(int*)((char*)logic + 0x1ac);
+    if (outActiveSlot) *outActiveSlot = GetActivePlayerSlot(logic);
     return true;
 }
 
 static bool IsRemoteTurn(void* board) {
     if (g_AllowRemoteInput) return false;
-    int curPlayer = 0;
-    if (!IsOnlineDuelActive(board, nullptr, &curPlayer)) return false;
-    return curPlayer != g_LocalPlayerIdx;
+    int activeSlot = 0;
+    if (!IsOnlineDuelActive(board, nullptr, &activeSlot)) return false;
+    return activeSlot != g_LocalPlayerSlot;
 }
 
 static void BroadcastBoardStateSync(void* board, bool isInitial) {
@@ -969,6 +1033,23 @@ static void BroadcastBoardStateSync(void* board, bool isInitial) {
     LogMsg("Sent PKT_STATE_SYNC (initial=%d, bytes=%u)", (int)isInitial, stateLen);
 }
 
+static void SubmitLeaderboardResult(int scoreA, int scoreB) {
+    if (g_LeaderboardCode[0] == '\0') return;
+    g_MatchSeq++;
+    const char* modeStr = (g_ModePlayers == 4) ? "2v2" : "1v1";
+    int effectiveBalls = (g_BallsPerPlayer > 0) ? g_BallsPerPlayer : 6;
+    char json[512];
+    snprintf(
+        json, sizeof(json),
+        "{\"leaderboard\":\"%s\",\"matchId\":\"%s_%u_%d\",\"mode\":\"%s\",\"ballsPerPlayer\":%d,\"scoreA\":%d,\"scoreB\":%d}",
+        g_LeaderboardCode, g_RoomCode, (unsigned int)GetTickCount(), g_MatchSeq,
+        modeStr, effectiveBalls, scoreA, scoreB
+    );
+    SendPacket(PKT_MATCH_RESULT, json, (uint32_t)strlen(json));
+    LogMsg("Submitted PKT_MATCH_RESULT to leaderboard %s: A=%d vs B=%d (%s)",
+           g_LeaderboardCode, scoreA, scoreB, modeStr);
+}
+
 static void UpdateWindowTitleHUD(void* board) {
     std::lock_guard<std::mutex> lock(g_HudMutex);
     DWORD now = GetTickCount();
@@ -981,29 +1062,38 @@ static void UpdateWindowTitleHUD(void* board) {
     if (!hwnd || !IsWindow(hwnd)) return;
 
     bool isWs = (g_Role == ROLE_WS_HOST || g_Role == ROLE_WS_CLIENT);
-    const char* roleShort = (g_LocalPlayerIdx == 0) ? "P1" : "P2";
-    const char* roleStr = (g_LocalPlayerIdx == 0) ? "P1 (HOST)" : "P2 (CLIENT)";
-    char title[256];
+    const char* modeLabel = (g_ModePlayers == 4) ? "2v2" : "1v1";
+    char slotLabel[32];
+    if (g_ModePlayers == 4) {
+        snprintf(slotLabel, sizeof(slotLabel), "P%d Team %c",
+                 g_LocalPlayerSlot + 1, (g_LocalPlayerSlot % 2 == 0) ? 'A' : 'B');
+    } else {
+        snprintf(slotLabel, sizeof(slotLabel), "%s",
+                 (g_LocalPlayerSlot == 0) ? "P1 Host" : "P2 Join");
+    }
 
+    char title[256];
     if (!g_Connected) {
         if (isWs) {
             if (g_RelayOnline) {
+                int cnt = (int)g_RoomConnectedCount;
+                int maxP = (int)g_RoomMaxPlayers;
                 snprintf(title, sizeof(title),
-                    "Peggle Nights | ONLINE [Room: %s | %s] Waiting for friend in room %s... (F6:Role F7:Reconnect)",
-                    g_RoomCode, roleShort, g_RoomCode);
+                    "Peggle Nights | %s [Room: %s | %s] Waiting (%d/%d players)... (F6:Slot F7:Retry)",
+                    modeLabel, g_RoomCode, slotLabel, cnt, maxP);
             } else {
                 snprintf(title, sizeof(title),
-                    "Peggle Nights | ONLINE [Room: %s | %s] Connecting to server... (F6:Role F7:Reconnect)",
-                    g_RoomCode, roleShort);
+                    "Peggle Nights | %s [Room: %s | %s] Connecting to server... (F6:Slot F7:Retry)",
+                    modeLabel, g_RoomCode, slotLabel);
             }
         } else if (g_Role == ROLE_HOST) {
             snprintf(title, sizeof(title),
-                "Peggle Nights | ONLINE DUEL [%s] Waiting on port %d... (F6:Switch Role F7:Reset)",
-                roleStr, g_Port);
+                "Peggle Nights | ONLINE DUEL [P1 (HOST)] Waiting on port %d... (F6:Switch Role F7:Reset)",
+                g_Port);
         } else {
             snprintf(title, sizeof(title),
-                "Peggle Nights | ONLINE DUEL [%s] Connecting to %s:%d... (F6:Switch Role F7:Reset)",
-                roleStr, g_HostIp, g_Port);
+                "Peggle Nights | ONLINE DUEL [P2 (CLIENT)] Connecting to %s:%d... (F6:Switch Role F7:Reset)",
+                g_HostIp, g_Port);
         }
         SetWindowTextA(hwnd, title);
         return;
@@ -1014,30 +1104,53 @@ static void UpdateWindowTitleHUD(void* board) {
     uint8_t charDlg = board ? *(uint8_t*)((char*)board + 0x106) : 1;
 
     if (board && logic && gameMode == 3 && charDlg == 0) {
-        int curPlayer = *(int*)((char*)logic + 0x1ac);
-        int scoreP1   = *(int*)((char*)logic + 0x200);
-        int scoreP2   = *(int*)((char*)logic + 0x204);
-        const char* turnStr = (curPlayer == g_LocalPlayerIdx)
-            ? "YOUR TURN - AIM & FIRE!"
-            : "FRIEND'S TURN (Watching)";
-        if (isWs) {
-            snprintf(title, sizeof(title),
-                "Peggle Nights | ONLINE [Room: %s | %s] %s | Score: P1 %d vs P2 %d (F5:Sync)",
-                g_RoomCode, roleShort, turnStr, scoreP1, scoreP2);
+        int state     = *(int*)((char*)logic + 0x4);
+        int scoreA    = *(int*)((char*)logic + 0x200);
+        int scoreB    = *(int*)((char*)logic + 0x204);
+        int ballsA    = *(int*)((char*)logic + 0x208);
+        int ballsB    = *(int*)((char*)logic + 0x20c);
+
+        if (state == 5) {
+            if (g_LeaderboardCode[0]) {
+                snprintf(title, sizeof(title),
+                    "Peggle Nights | %s [Room: %s | %s] MATCH OVER! A %d vs B %d | Saved to LB: %s",
+                    modeLabel, g_RoomCode, slotLabel, scoreA, scoreB, g_LeaderboardCode);
+            } else {
+                snprintf(title, sizeof(title),
+                    "Peggle Nights | %s [Room: %s | %s] MATCH OVER! Team A %d vs Team B %d",
+                    modeLabel, g_RoomCode, slotLabel, scoreA, scoreB);
+            }
         } else {
-            snprintf(title, sizeof(title),
-                "Peggle Nights | ONLINE DUEL [%s] %s | Score: P1 %d vs P2 %d (F5:Sync)",
-                roleStr, turnStr, scoreP1, scoreP2);
+            int activeSlot = GetActivePlayerSlot(logic);
+            char turnStr[64];
+            if (activeSlot == g_LocalPlayerSlot) {
+                snprintf(turnStr, sizeof(turnStr), "YOUR TURN - AIM & FIRE!");
+            } else if (g_ModePlayers == 4) {
+                snprintf(turnStr, sizeof(turnStr), "P%d'S TURN (Team %c)",
+                         activeSlot + 1, (activeSlot % 2 == 0) ? 'A' : 'B');
+            } else {
+                snprintf(turnStr, sizeof(turnStr), "FRIEND'S TURN (Watching)");
+            }
+
+            if (isWs) {
+                snprintf(title, sizeof(title),
+                    "Peggle Nights | %s [Room: %s | %s] %s | A:%d(%d) vs B:%d(%d) (F5:Sync)",
+                    modeLabel, g_RoomCode, slotLabel, turnStr, scoreA, ballsA, scoreB, ballsB);
+            } else {
+                snprintf(title, sizeof(title),
+                    "Peggle Nights | ONLINE DUEL [%s] %s | P1 %d vs P2 %d (F5:Sync)",
+                    slotLabel, turnStr, scoreA, scoreB);
+            }
         }
     } else {
         if (isWs) {
             snprintf(title, sizeof(title),
-                "Peggle Nights | ONLINE [Room: %s | %s] FRIEND JOINED! Enter Duel Mode & Click Play Now!",
-                g_RoomCode, roleShort);
+                "Peggle Nights | %s [Room: %s | %s] ALL %d READY! Enter Duel -> PLAY A FRIEND -> PLAY NOW!",
+                modeLabel, g_RoomCode, slotLabel, g_ModePlayers);
         } else {
             snprintf(title, sizeof(title),
                 "Peggle Nights | ONLINE DUEL [%s] CONNECTED! Enter Duel Mode & Click Start Game!",
-                roleStr);
+                slotLabel);
         }
     }
     SetWindowTextA(hwnd, title);
@@ -1055,12 +1168,19 @@ static void PollHotkeys(void* board) {
         MessageBeep(MB_ICONINFORMATION);
     }
     if (f6 && !f6Down) {
-        if (g_Role == ROLE_HOST) { g_Role = ROLE_CLIENT; g_LocalPlayerIdx = 1; }
-        else if (g_Role == ROLE_CLIENT) { g_Role = ROLE_HOST; g_LocalPlayerIdx = 0; }
-        else if (g_Role == ROLE_RELAY_HOST) { g_Role = ROLE_RELAY_CLIENT; g_LocalPlayerIdx = 1; }
-        else if (g_Role == ROLE_RELAY_CLIENT) { g_Role = ROLE_RELAY_HOST; g_LocalPlayerIdx = 0; }
-        else if (g_Role == ROLE_WS_HOST) { g_Role = ROLE_WS_CLIENT; g_LocalPlayerIdx = 1; }
-        else { g_Role = ROLE_WS_HOST; g_LocalPlayerIdx = 0; }
+        if (g_Role == ROLE_WS_HOST || g_Role == ROLE_WS_CLIENT) {
+            g_LocalPlayerSlot = (g_LocalPlayerSlot + 1) % g_ModePlayers;
+            g_LocalPlayerIdx = g_LocalPlayerSlot;
+            g_Role = (g_LocalPlayerSlot == 0) ? ROLE_WS_HOST : ROLE_WS_CLIENT;
+        } else if (g_Role == ROLE_HOST) {
+            g_Role = ROLE_CLIENT; g_LocalPlayerSlot = 1; g_LocalPlayerIdx = 1;
+        } else if (g_Role == ROLE_CLIENT) {
+            g_Role = ROLE_HOST; g_LocalPlayerSlot = 0; g_LocalPlayerIdx = 0;
+        } else if (g_Role == ROLE_RELAY_HOST) {
+            g_Role = ROLE_RELAY_CLIENT; g_LocalPlayerSlot = 1; g_LocalPlayerIdx = 1;
+        } else {
+            g_Role = ROLE_RELAY_HOST; g_LocalPlayerSlot = 0; g_LocalPlayerIdx = 0;
+        }
         g_WantReconnect = true;
         CloseActiveTransport();
         MessageBeep(MB_ICONWARNING);
@@ -1083,6 +1203,8 @@ static void __fastcall Hook_Board_Update(void* board, void* /*edx*/) {
         g_PrevLogicState = 0;
         g_ShotSentThisTurn = false;
         g_LocalWasShooting = false;
+        g_MatchBallsApplied = false;
+        g_MatchResultSent = false;
     }
 
     void* logic = *(void**)((char*)board + 0x720);
@@ -1091,15 +1213,16 @@ static void __fastcall Hook_Board_Update(void* board, void* /*edx*/) {
     uint8_t charDlgOpen = *(uint8_t*)((char*)board + 0x106);
 
     if (g_ModEnabled && g_Connected && logic && gameMode == 3) {
-        // Always force Duel mode to Human vs Human (disable Computer AI for both slots)
+        // Always force Duel mode to Human vs Human (disable Computer AI for both sides)
         *(uint8_t*)((char*)logic + 0x1a8) = 1; // mIsDuel = 1
         *(uint8_t*)((char*)logic + 0x2d8) = 0; // mIsComputer[0] = 0
         *(uint8_t*)((char*)logic + 0x2d9) = 0; // mIsComputer[1] = 0
 
         int state = *(int*)((char*)logic + 0x4);
-        int curPlayer = *(int*)((char*)logic + 0x1ac);
+        int shot0 = *(int*)((char*)logic + 0x2dc);
+        int shot1 = *(int*)((char*)logic + 0x358);
 
-        // 1. Check if Host just closed CharacterDialog to start a new Duel match, or Peer just connected
+        // 1. Host applies custom balls per player & broadcasts initial board state
         bool peerJoined = false;
         {
             std::lock_guard<std::mutex> lock(g_NetMutex);
@@ -1109,15 +1232,35 @@ static void __fastcall Hook_Board_Update(void* board, void* /*edx*/) {
             }
         }
 
-        if (g_LocalPlayerIdx == 0 && charDlgOpen == 0) {
-            if ((g_PrevCharDlgOpen != 0 && state == 1) || (peerJoined && state == 1)) {
+        if (g_LocalPlayerSlot == 0 && charDlgOpen == 0 && state == 1) {
+            if (shot0 == 0 && shot1 == 0) {
+                g_MatchResultSent = false;
+                if (!g_MatchBallsApplied && g_BallsPerPlayer > 0) {
+                    int teamBalls = (g_ModePlayers == 4) ? (g_BallsPerPlayer * 2) : g_BallsPerPlayer;
+                    *(int*)((char*)logic + 0x208) = teamBalls;
+                    *(int*)((char*)logic + 0x20c) = teamBalls;
+                    Engine_Interface_SetNumBalls(*(void**)((char*)board + 0x718), teamBalls);
+                    g_MatchBallsApplied = true;
+                    LogMsg("Applied custom ball count: %d/player (%d/team)", g_BallsPerPlayer, teamBalls);
+                }
+            }
+            if (g_PrevCharDlgOpen != 0 || peerJoined) {
                 BroadcastBoardStateSync(board, true);
                 g_ShotSentThisTurn = false;
             }
         }
         g_PrevCharDlgOpen = charDlgOpen;
 
-        // 2. Check if our own shot just finished and transitioned back to State 1 (next turn!)
+        // 2. Host submits match result once when entering End Level (state == 5)
+        if (g_LocalPlayerSlot == 0 && charDlgOpen == 0 && state == 5 &&
+            !g_MatchResultSent && (shot0 + shot1) > 0) {
+            int scoreA = *(int*)((char*)logic + 0x200);
+            int scoreB = *(int*)((char*)logic + 0x204);
+            SubmitLeaderboardResult(scoreA, scoreB);
+            g_MatchResultSent = true;
+        }
+
+        // 3. Check if our own shot just finished and transitioned back to State 1 (next turn!)
         if (charDlgOpen == 0 && state == 1 && g_PrevLogicState != 1) {
             g_ShotSentThisTurn = false;
             if (g_LocalWasShooting) {
@@ -1127,7 +1270,7 @@ static void __fastcall Hook_Board_Update(void* board, void* /*edx*/) {
         }
         g_PrevLogicState = state;
 
-        // 3. Apply incoming PKT_STATE_SYNC if ready
+        // 4. Apply incoming PKT_STATE_SYNC if ready
         if (charDlgOpen == 0) {
             QueuedStateSync syncToApply;
             {
@@ -1151,23 +1294,27 @@ static void __fastcall Hook_Board_Update(void* board, void* /*edx*/) {
                     *(uint8_t*)((char*)logic + 0x2d8) = 0;
                     *(uint8_t*)((char*)logic + 0x2d9) = 0;
                     state = *(int*)((char*)logic + 0x4);
-                    curPlayer = *(int*)((char*)logic + 0x1ac);
+                    int curTeam = *(int*)((char*)logic + 0x1ac);
+                    Engine_Interface_SetNumBalls(
+                        *(void**)((char*)board + 0x718),
+                        *(int*)((char*)logic + 0x208 + curTeam * 4)
+                    );
                 }
                 g_ShotSentThisTurn = false;
                 g_LocalWasShooting = false;
-                LogMsg("Applied PKT_STATE_SYNC (curPlayer=%d, state=%d)", curPlayer, state);
+                LogMsg("Applied PKT_STATE_SYNC (activeSlot=%d, state=%d)", GetActivePlayerSlot(logic), state);
             }
         }
 
-        // 4. Local Player's Turn vs Remote Player's Turn
+        // 5. Local Player's Turn vs Remote Player's Turn
         if (charDlgOpen == 0 && logic) {
-            if (curPlayer == g_LocalPlayerIdx) {
+            int activeSlot = GetActivePlayerSlot(logic);
+            if (activeSlot == g_LocalPlayerSlot) {
                 // LOCAL TURN
                 if (state == 1) {
                     uint8_t wantFire = *(uint8_t*)((char*)logic + 0xf9);
                     uint8_t fireNow  = *(uint8_t*)((char*)logic + 0xf8);
                     if ((wantFire != 0 || fireNow != 0) && !g_ShotSentThisTurn) {
-                        // Finalize any pending mouse aim calculation before capturing angle
                         if (*(uint8_t*)((char*)logic + 0x20) != 0) {
                             Engine_Logic_CalcMouseAim(logic);
                         }
@@ -1181,9 +1328,8 @@ static void __fastcall Hook_Board_Update(void* board, void* /*edx*/) {
 
                         g_ShotSentThisTurn = true;
                         g_LocalWasShooting = true;
-                        LogMsg("Sent PKT_FIRE (angle=%.4f)", fireAngle);
+                        LogMsg("Sent PKT_FIRE (slot=%d, angle=%.4f)", g_LocalPlayerSlot, fireAngle);
                     } else if (!g_ShotSentThisTurn) {
-                        // Stream live cannon aim angle (~25 Hz)
                         float curAngle = *(float*)((char*)logic + 0xec);
                         DWORD now = GetTickCount();
                         if (fabsf(curAngle - g_LastSentAngle) > 0.002f && (now - g_LastAimSendMs >= 40)) {
@@ -1196,8 +1342,8 @@ static void __fastcall Hook_Board_Update(void* board, void* /*edx*/) {
                     g_LocalWasShooting = true;
                 }
             } else {
-                // REMOTE TURN (Watching friend)
-                *(uint8_t*)((char*)logic + 0x20) = 0; // Prevent local mouse from overwriting aim
+                // REMOTE TURN (Watching)
+                *(uint8_t*)((char*)logic + 0x20) = 0;
 
                 QueuedFire fireToApply;
                 bool hasAim = false;
@@ -1229,8 +1375,8 @@ static void __fastcall Hook_Board_Update(void* board, void* /*edx*/) {
                     *(uint8_t*)((char*)logic + 0x20) = 0;
                     *(float*)((char*)logic + 0xec) = fireToApply.angle;
                     Engine_Gun_SetAngle(gun, fireToApply.angle, 1);
-                    *(uint8_t*)((char*)logic + 0xf9) = 1; // Trigger shot!
-                    LogMsg("Applied PKT_FIRE (angle=%.4f)", fireToApply.angle);
+                    *(uint8_t*)((char*)logic + 0xf9) = 1;
+                    LogMsg("Applied PKT_FIRE (from slot=%d, angle=%.4f)", activeSlot, fireToApply.angle);
                 }
 
                 if (!clicksToApply.empty()) {
@@ -1270,14 +1416,13 @@ static void __fastcall Hook_Board_MouseDown(void* board, void* /*edx*/, int x, i
     if (IsRemoteTurn(board)) return;
 
     void* logic = nullptr;
-    int curPlayer = 0;
-    bool onlineActive = IsOnlineDuelActive(board, &logic, &curPlayer);
+    int activeSlot = 0;
+    bool onlineActive = IsOnlineDuelActive(board, &logic, &activeSlot);
     int stateBefore = (onlineActive && logic) ? *(int*)((char*)logic + 0x4) : 0;
 
     Orig_Board_MouseDown(board, x, y, clickCount);
 
-    // If local player clicked during ball flight (Flippers / Space Blast / Fast-forward), forward to peer
-    if (onlineActive && !g_AllowRemoteInput && curPlayer == g_LocalPlayerIdx && stateBefore == 2) {
+    if (onlineActive && !g_AllowRemoteInput && activeSlot == g_LocalPlayerSlot && stateBefore == 2) {
         uint8_t pkt[13];
         pkt[0] = 1;
         memcpy(pkt + 1, &clickCount, 4);
@@ -1291,13 +1436,13 @@ static void __fastcall Hook_Board_MouseUp(void* board, void* /*edx*/, int x, int
     if (IsRemoteTurn(board)) return;
 
     void* logic = nullptr;
-    int curPlayer = 0;
-    bool onlineActive = IsOnlineDuelActive(board, &logic, &curPlayer);
+    int activeSlot = 0;
+    bool onlineActive = IsOnlineDuelActive(board, &logic, &activeSlot);
     int stateBefore = (onlineActive && logic) ? *(int*)((char*)logic + 0x4) : 0;
 
     Orig_Board_MouseUp(board, x, y, clickCount);
 
-    if (onlineActive && !g_AllowRemoteInput && curPlayer == g_LocalPlayerIdx && stateBefore == 2) {
+    if (onlineActive && !g_AllowRemoteInput && activeSlot == g_LocalPlayerSlot && stateBefore == 2) {
         uint8_t pkt[13];
         pkt[0] = 0;
         memcpy(pkt + 1, &clickCount, 4);
@@ -1318,19 +1463,19 @@ static void __fastcall Hook_Board_KeyUp(void* board, void* /*edx*/, int keyCode)
 }
 
 static void __fastcall Hook_App_GotFocus(void* app, void* /*edx*/) {
-    if (g_ModEnabled) return; // Prevent focus changes from toggling Board::Pause
+    if (g_ModEnabled) return;
     Orig_App_GotFocus(app);
 }
 
 static void __fastcall Hook_App_LostFocus(void* app, void* /*edx*/) {
-    if (g_ModEnabled) return; // Keep game running when alt-tabbed / unfocused!
+    if (g_ModEnabled) return;
     Orig_App_LostFocus(app);
 }
 
 // ============================================================================
 // 5. Initialization & VTable Patching
 // ============================================================================
-static void NormalizeRoomCode(char* buf) {
+static void NormalizeRoomCode(char* buf, const char* fallback) {
     size_t w = 0;
     for (size_t r = 0; buf[r] != '\0' && w < 12; r++) {
         unsigned char c = (unsigned char)buf[r];
@@ -1339,44 +1484,95 @@ static void NormalizeRoomCode(char* buf) {
         }
     }
     buf[w] = '\0';
-    if (w < 2) {
-        strcpy(buf, "PEGG");
+    if (w < 2 && fallback) {
+        strcpy(buf, fallback);
     }
+}
+
+static void SanitizeLbCode(char* buf) {
+    size_t w = 0;
+    for (size_t r = 0; buf[r] != '\0' && w < 16; r++) {
+        unsigned char c = (unsigned char)buf[r];
+        if (isalnum(c) || c == '-') {
+            buf[w++] = (char)toupper(c);
+        }
+    }
+    buf[w] = '\0';
+    if (w < 2) buf[0] = '\0';
+}
+
+static void SanitizeDisplayName(char* buf) {
+    size_t w = 0;
+    for (size_t r = 0; buf[r] != '\0' && w < 24; r++) {
+        unsigned char c = (unsigned char)buf[r];
+        if (c >= 0x20 && c != 0x7f && c != '"' && c != '\\') {
+            buf[w++] = (char)c;
+        }
+    }
+    buf[w] = '\0';
+    while (w > 0 && isspace((unsigned char)buf[w - 1])) buf[--w] = '\0';
+    if (w == 0) strcpy(buf, "Player");
 }
 
 static void LoadConfig(const char* iniPath) {
     g_ModEnabled = GetPrivateProfileIntA("Online", "enabled", 1, iniPath) != 0;
     g_Port       = GetPrivateProfileIntA("Online", "port", 27888, iniPath);
+
+    int modeP = GetPrivateProfileIntA("Online", "mode_players", 2, iniPath);
+    g_ModePlayers = (modeP == 4) ? 4 : 2;
+
+    int bpp = GetPrivateProfileIntA("Online", "balls_per_player", 0, iniPath);
+    if (bpp < 0) bpp = 0;
+    if (bpp > 6) bpp = 6;
+    g_BallsPerPlayer = bpp;
+
+    GetPrivateProfileStringA("Online", "player_name", "Player", g_PlayerName, sizeof(g_PlayerName), iniPath);
+    SanitizeDisplayName(g_PlayerName);
+
+    GetPrivateProfileStringA("Online", "leaderboard_code", "", g_LeaderboardCode, sizeof(g_LeaderboardCode), iniPath);
+    SanitizeLbCode(g_LeaderboardCode);
+
     GetPrivateProfileStringA("Online", "host_ip", "127.0.0.1", g_HostIp, sizeof(g_HostIp), iniPath);
     GetPrivateProfileStringA("Online", "relay_url", "", g_RelayUrl, sizeof(g_RelayUrl), iniPath);
     GetPrivateProfileStringA("Online", "room_code", "PEGG", g_RoomCode, sizeof(g_RoomCode), iniPath);
-    NormalizeRoomCode(g_RoomCode);
+    NormalizeRoomCode(g_RoomCode, "PEGG");
 
     char roleBuf[64] = {};
     GetPrivateProfileStringA("Online", "role", "host", roleBuf, sizeof(roleBuf), iniPath);
+    int defaultSlot = 0;
     if (_stricmp(roleBuf, "client") == 0) {
         g_Role = ROLE_CLIENT;
-        g_LocalPlayerIdx = 1;
+        defaultSlot = 1;
     } else if (_stricmp(roleBuf, "relay_host") == 0) {
         g_Role = ROLE_RELAY_HOST;
-        g_LocalPlayerIdx = 0;
+        defaultSlot = 0;
     } else if (_stricmp(roleBuf, "relay_client") == 0) {
         g_Role = ROLE_RELAY_CLIENT;
-        g_LocalPlayerIdx = 1;
+        defaultSlot = 1;
     } else if (_stricmp(roleBuf, "ws_host") == 0) {
         g_Role = ROLE_WS_HOST;
-        g_LocalPlayerIdx = 0;
+        defaultSlot = 0;
     } else if (_stricmp(roleBuf, "ws_client") == 0) {
         g_Role = ROLE_WS_CLIENT;
-        g_LocalPlayerIdx = 1;
+        defaultSlot = 1;
     } else {
         g_Role = ROLE_HOST;
-        g_LocalPlayerIdx = 0;
+        defaultSlot = 0;
+    }
+
+    int slot = GetPrivateProfileIntA("Online", "player_slot", -1, iniPath);
+    if (slot >= 0 && slot < g_ModePlayers) {
+        g_LocalPlayerSlot = slot;
+    } else {
+        g_LocalPlayerSlot = defaultSlot;
+    }
+    g_LocalPlayerIdx = g_LocalPlayerSlot;
+    if (g_Role == ROLE_WS_HOST || g_Role == ROLE_WS_CLIENT) {
+        g_Role = (g_LocalPlayerSlot == 0) ? ROLE_WS_HOST : ROLE_WS_CLIENT;
     }
 }
 
 static void InstallHooksIfInnerGame() {
-    // Verify we are inside the Peggle Nights inner game binary (Sexy::Board vtable at 0x6864a4)
     __try {
         uintptr_t* boardVtbl = (uintptr_t*)ADDR_BOARD_VTABLE;
         uintptr_t* appVtbl   = (uintptr_t*)ADDR_APP_VTABLE;
@@ -1392,21 +1588,22 @@ static void InstallHooksIfInnerGame() {
         snprintf(iniPath, sizeof(iniPath), "%speggle_online.ini", g_ModDir);
         LoadConfig(iniPath);
 
-        LogMsg("=== %s Loaded (enabled=%d, role=%d, ip=%s, port=%d, relay=%s, room=%s) ===",
-               kModMarker, (int)g_ModEnabled, (int)g_Role, g_HostIp, g_Port, g_RelayUrl, g_RoomCode);
+        LogMsg("=== %s Loaded (enabled=%d, mode=%d, slot=%d, balls=%d, name=%s, lb=%s, room=%s) ===",
+               kModMarker, (int)g_ModEnabled, g_ModePlayers, g_LocalPlayerSlot,
+               g_BallsPerPlayer, g_PlayerName, g_LeaderboardCode, g_RoomCode);
 
         if (!g_ModEnabled) return;
 
         DWORD oldProt = 0;
         VirtualProtect(boardVtbl, 70 * sizeof(uintptr_t), PAGE_EXECUTE_READWRITE, &oldProt);
-        Orig_Board_Update     = (FnBoardUpdate)boardVtbl[22];     // +0x58
-        Orig_Board_KeyDown    = (FnBoardKeyDown)boardVtbl[48];    // +0xc0
-        Orig_Board_KeyUp      = (FnBoardKeyUp)boardVtbl[49];      // +0xc4
-        Orig_Board_MouseMove  = (FnBoardMouseMove)boardVtbl[52];  // +0xd0
-        Orig_Board_MouseDown  = (FnBoardMouseDown)boardVtbl[54];  // +0xd8
-        Orig_Board_MouseUp    = (FnBoardMouseUp)boardVtbl[56];    // +0xe0
-        Orig_Board_MouseDrag  = (FnBoardMouseDrag)boardVtbl[58];  // +0xe8
-        Orig_Board_MouseWheel = (FnBoardMouseWheel)boardVtbl[59]; // +0xec
+        Orig_Board_Update     = (FnBoardUpdate)boardVtbl[22];
+        Orig_Board_KeyDown    = (FnBoardKeyDown)boardVtbl[48];
+        Orig_Board_KeyUp      = (FnBoardKeyUp)boardVtbl[49];
+        Orig_Board_MouseMove  = (FnBoardMouseMove)boardVtbl[52];
+        Orig_Board_MouseDown  = (FnBoardMouseDown)boardVtbl[54];
+        Orig_Board_MouseUp    = (FnBoardMouseUp)boardVtbl[56];
+        Orig_Board_MouseDrag  = (FnBoardMouseDrag)boardVtbl[58];
+        Orig_Board_MouseWheel = (FnBoardMouseWheel)boardVtbl[59];
 
         boardVtbl[22] = (uintptr_t)&Hook_Board_Update;
         boardVtbl[48] = (uintptr_t)&Hook_Board_KeyDown;
@@ -1419,8 +1616,8 @@ static void InstallHooksIfInnerGame() {
         VirtualProtect(boardVtbl, 70 * sizeof(uintptr_t), oldProt, &oldProt);
 
         VirtualProtect(appVtbl, 108 * sizeof(uintptr_t), PAGE_EXECUTE_READWRITE, &oldProt);
-        Orig_App_GotFocus  = (FnAppFocus)appVtbl[84]; // +0x150
-        Orig_App_LostFocus = (FnAppFocus)appVtbl[85]; // +0x154
+        Orig_App_GotFocus  = (FnAppFocus)appVtbl[84];
+        Orig_App_LostFocus = (FnAppFocus)appVtbl[85];
         appVtbl[84] = (uintptr_t)&Hook_App_GotFocus;
         appVtbl[85] = (uintptr_t)&Hook_App_LostFocus;
         VirtualProtect(appVtbl, 108 * sizeof(uintptr_t), oldProt, &oldProt);
